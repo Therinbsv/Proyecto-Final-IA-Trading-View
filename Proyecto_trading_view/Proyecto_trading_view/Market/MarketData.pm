@@ -1,0 +1,246 @@
+package Market::MarketData;
+
+# =============================================================================
+# Market::MarketData
+# Responsabilidad: almacenar y gestionar datos de mercado OHLCV.
+# Garantiza sincronizacion temporal, acceso eficiente por indice
+# y construccion de temporalidades (1m -> 5m -> 15m).
+# =============================================================================
+
+use strict;
+use warnings;
+use Time::Moment;
+
+use constant ANCHOR_OFFSET_SEC => 3600;
+my @DAY_NAMES = qw(Mon Tue Wed Thu Fri Sat Sun);
+
+# -----------------------------------------------------------------------------
+# new
+# -----------------------------------------------------------------------------
+sub new {
+    my ($class) = @_;
+    my $self = {
+        data => {
+            '1m'  => [],
+            '5m'  => [],
+            '15m' => [],
+            '1h'  => [],
+            '2h'  => [],
+            '4h'  => [],
+            'D'   => [],
+            'W'   => [],
+        },
+        tf => '1m',
+    };
+    bless $self, $class;
+    return $self;
+}
+
+sub get_data {
+    my ($self) = @_;
+    return $self->{data};
+}
+
+sub add_candle {
+    my ($self, $candle) = @_;
+    push @{ $self->{data}{'1m'} }, $candle;
+}
+
+# -----------------------------------------------------------------------------
+# build_tf_candles
+# FIX: Agrupacion anclada al reloj (Clock-Aligned Grouping).
+# Se utiliza el timestamp (Epoch) para forzar que las velas de 5m/15m
+# nazcan en multiplos exactos del reloj (ej. 23:20, 23:25), resolviendo
+# desfases y huecos de mercado (missing candles).
+# -----------------------------------------------------------------------------
+sub build_tf_candles {
+    my ($self, $tf) = @_;
+
+    my %minutes = (
+        '5m'  => 5,
+        '15m' => 15,
+        '1h'  => 60,
+        '2h'  => 120,
+        '4h'  => 240,
+        'D'   => 1440,
+        'W'   => 10080,
+    );
+    my $n = $minutes{$tf} or return;
+    my $interval_sec = $n * 60;
+
+    my $src = $self->{data}{'1m'};
+    my @result;
+    my $current_candle = undef;
+    # --- BLOQUE TIMEZONE/SESION: solo 1h/2h/4h reciben el anclaje +1h ---
+    my $apply_anchor = ( $tf eq '1h' || $tf eq '2h' || $tf eq '4h' );
+    my $anchor_sec   = $apply_anchor ? ANCHOR_OFFSET_SEC : 0;
+    # --- FIN BLOQUE TIMEZONE/SESION ---
+
+    for my $c (@$src) {
+        # Ancla matematica del Epoch al bloque de tiempo exacto
+        my $bucket_ts;
+        if ($tf eq 'W') {
+            # Desplazamos el epoch 3 días para que el lunes sea el inicio de semana
+            # (1970-01-01 fue jueves, jueves - 3 días = lunes)
+            my $offset_days = 3;
+            my $offset_sec  = $offset_days * 86400;
+            $bucket_ts = int(($c->{ts} + $offset_sec) / $interval_sec) * $interval_sec - $offset_sec;
+        } else {
+            # --- BLOQUE TIMEZONE/SESION: desplazar, alinear, regresar ---
+            my $shifted = $c->{ts} - $anchor_sec;
+            $bucket_ts = int( $shifted / $interval_sec ) * $interval_sec + $anchor_sec;
+            # --- FIN BLOQUE TIMEZONE/SESION ---
+        }
+
+        if (!defined $current_candle || $current_candle->{ts} != $bucket_ts) {
+            # Si ya teniamos una vela construyendose, la guardamos
+            push @result, $current_candle if defined $current_candle;
+
+            # Construimos la nueva etiqueta de tiempo perfecta
+            my $tm = Time::Moment->from_epoch($bucket_ts);
+            my $time_str = sprintf(
+                "%04d-%02d-%02dT%02d:%02d:00",
+                $tm->year, $tm->month, $tm->day_of_month, $tm->hour, $tm->minute
+            );
+
+            # Inicializamos la nueva vela anclada
+            $current_candle = {
+                time   => $time_str,
+                ts     => $bucket_ts,
+                open   => $c->{open},
+                high   => $c->{high},
+                low    => $c->{low},
+                close  => $c->{close},
+                volume => $c->{volume},
+            };
+        } else {
+            # Actualizamos la vela en curso
+            $current_candle->{high}  = $c->{high} if $c->{high} > $current_candle->{high};
+            $current_candle->{low}   = $c->{low}  if $c->{low}  < $current_candle->{low};
+            $current_candle->{close} = $c->{close};
+            $current_candle->{volume} += $c->{volume};
+        }
+    }
+    
+    # Guardar la ultima vela que quedo en el buffer
+    push @result, $current_candle if defined $current_candle;
+
+    $self->{data}{$tf} = \@result;
+}
+
+sub build_timeframes {
+    my ($self) = @_;
+    $self->build_tf_candles('5m');
+    $self->build_tf_candles('15m');
+    $self->build_tf_candles('1h');
+    $self->build_tf_candles('2h');
+    $self->build_tf_candles('4h');
+    $self->build_tf_candles('D');
+    $self->build_tf_candles('W');
+}
+
+sub set_timeframe {
+    my ($self, $tf) = @_;
+    $self->{tf} = $tf if exists $self->{data}{$tf};
+}
+
+sub get_timeframe {
+    my ($self) = @_;
+    return $self->{tf};
+}
+
+sub _active_array {
+    my ($self) = @_;
+    return $self->{data}{ $self->{tf} };
+}
+
+sub get_slice {
+    my ($self, $start, $end) = @_;
+    my $arr  = $self->_active_array;
+    my $last = $#$arr;
+    $start   = 0     if $start < 0;
+    $end     = $last if $end > $last;
+    return [] if $start > $end;
+    return [ @{$arr}[$start .. $end] ];
+}
+
+sub get_candle {
+    my ($self, $index) = @_;
+    my $arr = $self->_active_array;
+    return undef if $index < 0 || $index > $#$arr;
+    return $arr->[$index];
+}
+
+sub size {
+    my ($self) = @_;
+    return scalar @{ $self->_active_array };
+}
+
+sub last_candle {
+    my ($self) = @_;
+    my $arr = $self->_active_array;
+    return undef unless @$arr;
+    return $arr->[-1];
+}
+
+sub last_index {
+    my ($self) = @_;
+    return $#{ $self->_active_array };
+}
+
+sub get_timestamp {
+    my ($self, $index) = @_;
+    my $c = $self->get_candle($index);
+    return $c ? $c->{ts} : undef;
+}
+
+sub merge_delta_row {
+    my ($self, $row) = @_;
+    my $arr = $self->{data}{'1m'};
+
+    if (@$arr && $arr->[-1]{ts} == $row->{ts}) {
+        my $e = $arr->[-1];
+        $e->{high}   = $row->{high} if $row->{high} > $e->{high};
+        $e->{low}    = $row->{low}  if $row->{low}  < $e->{low};
+        $e->{close}  = $row->{close};
+        $e->{volume} = $e->{volume} + $row->{volume};
+    } else {
+        $self->add_candle($row);
+    }
+}
+
+sub compute_time_anchors {
+    my ($self) = @_;
+    my $arr      = $self->_active_array;
+    my @anchors;
+    my $last_day  = -1;
+    my $last_hour = -1;
+
+    for my $i (0 .. $#$arr) {
+        my $ts  = $arr->[$i]{ts};
+        my $tm  = Time::Moment->from_epoch($ts);
+
+        my $day  = $tm->day_of_month;
+        my $hour = $tm->hour;
+        my $min  = $tm->minute;
+
+        if ($day != $last_day) {
+            my $dow   = $tm->day_of_week - 1;
+            my $label = $DAY_NAMES[$dow] . ' ' . sprintf('%d', $day);
+            push @anchors, { index => $i, label => $label, ts => $ts };
+            $last_day  = $day;
+            $last_hour = $hour;
+        } elsif ($hour != $last_hour) {
+            push @anchors, {
+                index => $i,
+                label => sprintf('%02d:%02d', $hour, $min),
+                ts    => $ts,
+            };
+            $last_hour = $hour;
+        }
+    }
+
+    return \@anchors;
+}
+
+1;
